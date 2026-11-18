@@ -1,5 +1,7 @@
 # Linux 4.4.94+ for HiBy X1600 players
 
+(THIS IS THE SUCCESSOR TO M4ttia's CUSTOM KERNEL REPO)
+
 A kit to rebuild the kernel of the HiBy players built on the **Ingenic X1600** from Ingenic's public SDK and put it into a firmware image, for anyone making custom firmware for them.
 
 | board | `--model` | state |
