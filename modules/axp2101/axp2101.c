@@ -12,9 +12,21 @@
 //   charge_voltage_limit   end of charge voltage, mV (4200)
 //   charge_term_current    charge termination current, mA (100)
 //   dcdc3_always_pwmmode   1 keeps DCDC3 in PWM mode while the system runs
+//   dcdc4_auto_x1600e_en_hn
+//                          1 sets DCDC4 from the SoC ID read from the efuse:
+//                          1.8 V on an X1600EN (0x4a00) or X1600HN (0x4900),
+//                          1.2 V on an X1600E (0x0a00), an unknown ID or a
+//                          failed read; it overrides the dcdc4 parameter
 //   dcdc1 ... cpusldo      one per regulator, as "regulator_name=NAME
 //                          boot_on=enable|disable work_voltage=uV
 //                          suspend_volage=uV"; the name is not used
+//
+// Two read-only parameters give what dcdc4_auto_x1600e_en_hn read, for the
+// stock r1_wireless_select.sh (firmware 2.0), which picks the R1's Wi-Fi chip
+// by SoC (BCM on the X1600E, AIC8800 on the EN and HN):
+//
+//   detected_soc_id        the SoC ID, 0 if not read
+//   detected_soc_id_valid  Y once it was read
 //
 // Loading creates the I2C device "axp2101_mfd". Its driver registers the
 // interrupt chip and the cells of the PMIC; two of them have drivers here:
@@ -37,6 +49,7 @@
 // Loaded after utils.ko, which provides i2c_register_device() and the pin and
 // regulator parameters.
 
+#include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/device.h>
 #include <linux/err.h>
@@ -44,6 +57,7 @@
 #include <linux/gpio/consumer.h>
 #include <linux/i2c.h>
 #include <linux/interrupt.h>
+#include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/kthread.h>
 #include <linux/ktime.h>
@@ -61,6 +75,8 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/workqueue.h>
+
+#include <asm/addrspace.h>
 
 // Exported by utils.ko.
 extern const struct kernel_param_ops param_gpio_ops;
@@ -1911,6 +1927,9 @@ static int i2c_bus_num = -1;
 static int charge_voltage_limit = 4200;
 static int charge_term_current = 100;
 static int dcdc3_always_pwmmode;
+static bool dcdc4_auto_x1600e_en_hn;
+static unsigned int detected_soc_id;
+static bool detected_soc_id_valid;
 
 static struct axp_charger_pdata axp_sply_init_data = {
 	.charge_current = 780,
@@ -1985,6 +2004,91 @@ static bool axp_rail_voltage_ok(int rail, unsigned int uv, const char *what)
 	return false;
 }
 
+// The SoC ID in the efuse, as the vendor module reads it: 3 bytes from byte
+// 0x2b, the ID in the low 16 bits of the first data word.
+#define EFUSE_BASE		((void __iomem *)CKSEG1ADDR(0x13540000))
+#define EFUSE_CTRL		0x00
+#define EFUSE_CFG		0x04
+#define EFUSE_STATE		0x08
+#define EFUSE_DATA0		0x0c
+#define EFUSE_CFG_SOC_ID	0x00250000	// read timings
+#define EFUSE_CTRL_SOC_ID	((0x2b << 21) | (2 << 16) | BIT(0))
+#define EFUSE_STATE_RD_DONE	BIT(0)
+#define EFUSE_POLLS		1000000
+
+#define SOC_ID_X1600E		0x0a00
+#define SOC_ID_X1600EN		0x4a00
+#define SOC_ID_X1600HN		0x4900
+
+#define DCDC4_X1600E_UV		1200000
+#define DCDC4_X1600EN_HN_UV	1800000
+
+static int axp_read_soc_id(unsigned int *id)
+{
+	struct clk *clk;
+	int ret, n;
+
+	clk = clk_get(NULL, "gate_efuse");
+	if (IS_ERR(clk))
+		return PTR_ERR(clk);
+	ret = clk_prepare_enable(clk);
+	if (ret)
+		goto put;
+
+	writel(EFUSE_CFG_SOC_ID, EFUSE_BASE + EFUSE_CFG);
+	writel(0, EFUSE_BASE + EFUSE_CTRL);
+	writel(0, EFUSE_BASE + EFUSE_STATE);
+	writel(EFUSE_CTRL_SOC_ID, EFUSE_BASE + EFUSE_CTRL);
+	ret = -ETIMEDOUT;
+	for (n = EFUSE_POLLS; n; n--) {
+		if (readl(EFUSE_BASE + EFUSE_STATE) & EFUSE_STATE_RD_DONE) {
+			*id = readl(EFUSE_BASE + EFUSE_DATA0) & 0xffff;
+			ret = 0;
+			break;
+		}
+	}
+	writel(0, EFUSE_BASE + EFUSE_CTRL);
+	clk_disable_unprepare(clk);
+put:
+	clk_put(clk);
+	return ret;
+}
+
+// dcdc4_auto_x1600e_en_hn: DCDC4 by SoC, 1.2 V unless the SoC is known to
+// need 1.8 V.
+static void axp_dcdc4_by_soc(void)
+{
+	struct pmu_param *p = &axp_rail_params[AXP_DCDC4];
+	unsigned int id = 0;
+	int ret;
+
+	p->work_voltage = p->suspend_voltage = DCDC4_X1600E_UV;
+	detected_soc_id = 0;
+	detected_soc_id_valid = false;
+
+	ret = axp_read_soc_id(&id);
+	if (ret) {
+		pr_warn("AXP2101: SoC ID read failed (%d), DCDC4=%duV (safe)\n",
+			ret, DCDC4_X1600E_UV);
+		return;
+	}
+	detected_soc_id = id;
+	detected_soc_id_valid = true;
+
+	if (id == SOC_ID_X1600EN || id == SOC_ID_X1600HN) {
+		p->work_voltage = p->suspend_voltage = DCDC4_X1600EN_HN_UV;
+		pr_info("AXP2101: SoC=%s id=0x%04x DCDC4=%duV\n",
+			id == SOC_ID_X1600EN ? "X1600EN" : "X1600HN", id,
+			DCDC4_X1600EN_HN_UV);
+	} else if (id == SOC_ID_X1600E) {
+		pr_info("AXP2101: SoC=X1600E id=0x%04x DCDC4=%duV\n",
+			id, DCDC4_X1600E_UV);
+	} else {
+		pr_warn("AXP2101: unknown SoC ID=0x%04x, DCDC4=%duV (safe)\n",
+			id, DCDC4_X1600E_UV);
+	}
+}
+
 // Applies the regulator parameters to the regulators' constraints, and
 // creates the I2C device.
 static int axp2101_i2c_device_init(void)
@@ -1996,6 +2100,8 @@ static int axp2101_i2c_device_init(void)
 	axp_sply_init_data.term_current = charge_term_current;
 	axp_sply_init_data.voltage_limit = charge_voltage_limit;
 	axp_sply_init_data.dcdc3_pwm = dcdc3_always_pwmmode;
+	if (dcdc4_auto_x1600e_en_hn)
+		axp_dcdc4_by_soc();
 	printk("AXP2101: IRQ GPIO is %d -> irq is %d\n", pmu_int_gpio, irq);
 	printk("AXP2101: Charge Voltage Limit %d\n", charge_voltage_limit);
 	printk("AXP2101: Charge Current Term %d\n", charge_term_current);
@@ -2071,6 +2177,9 @@ module_param(i2c_bus_num, int, 0644);
 module_param(charge_voltage_limit, int, 0644);
 module_param(charge_term_current, int, 0644);
 module_param(dcdc3_always_pwmmode, int, 0644);
+module_param(dcdc4_auto_x1600e_en_hn, bool, 0644);
+module_param(detected_soc_id, uint, 0444);
+module_param(detected_soc_id_valid, bool, 0444);
 
 MODULE_AUTHOR("Mattia D'Oronzo <doronzomattia26@icloud.com>");
 MODULE_DESCRIPTION("X-Powers AXP2101 PMIC: regulators, charger, fuel gauge");
